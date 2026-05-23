@@ -1,999 +1,516 @@
-import streamlit as st
-import time
-from datetime import datetime
-from workflow import create_research_workflow
-from langchain_core.messages import HumanMessage
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.colors import HexColor
-import io
+import os
+import json
+import re
+from io import BytesIO
 
-# Page config
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from pypdf import PdfReader
+from langchain_openai import ChatOpenAI
+
+
+# =========================
+# ENV
+# =========================
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+# =========================
+# PAGE CONFIG
+# =========================
+
 st.set_page_config(
-    page_title="� ESG Research & Reporting System",
-    page_icon="�",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="ESG-AI Agent",
+    page_icon="🌱",
+    layout="wide"
 )
 
-# Custom CSS for better styling
-st.markdown("""
-<style>
-    .agent-card {
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-        border-left: 4px solid;
-    }
-    .lead-agent { border-left-color: #ff6b6b; background-color: #fff5f5; }
-    .academic-agent { border-left-color: #4ecdc4; background-color: #f0fffe; }
-    .web-agent { border-left-color: #45b7d1; background-color: #f0f9ff; }
-    .data-agent { border-left-color: #96ceb4; background-color: #f0fff4; }
-    .verification-agent { border-left-color: #ffeaa7; background-color: #fffdf0; }
-    .synthesis-agent { border-left-color: #fd79a8; background-color: #fef7f0; }
-    
-    .status-running { color: #ff6b6b; }
-    .status-complete { color: #00b894; }
-    .status-waiting { color: #636e72; }
-    
-    .agent-avatar {
-        font-size: 4rem;
-        text-align: center;
-        margin: 0.5rem;
-        animation: bounce 2s infinite;
-    }
-    
-    .agent-avatar.active {
-        animation: colorPulse 1.2s infinite ease-in-out;
-    }
-    
-    .agent-avatar.complete {
-        animation: none;
-        opacity: 0.7;
-    }
-    
-    @keyframes bounce {
-        0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
-        40% { transform: translateY(-10px); }
-        60% { transform: translateY(-5px); }
-    }
-    
-    @keyframes colorPulse {
-        0% { 
-            filter: brightness(1) hue-rotate(0deg) saturate(1);
-            transform: scale(1);
-            text-shadow: 0 0 10px rgba(255, 107, 107, 0.3);
+st.title("🌱 ESG-AI Agent")
+st.subheader("Sürdürülebilirlik Raporlarından ESG Veri Çıkarımı ve Greenwashing Risk Analizi")
+
+st.markdown(
+    """
+Bu uygulama; şirket sürdürülebilirlik raporlarından ESG değişkenlerini çıkarır, 
+kanıt cümleleri üretir, metinsel açıklama kalitesini skorlar ve sonuçları Excel olarak indirmenizi sağlar.
+"""
+)
+
+
+# =========================
+# HELPERS
+# =========================
+
+def read_pdf_text(uploaded_file):
+    """PDF dosyasından sayfa bazlı metin çıkarır."""
+    reader = PdfReader(uploaded_file)
+    pages = []
+
+    for i, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+
+        if text.strip():
+            pages.append({
+                "page_no": i,
+                "text": text
+            })
+
+    return pages
+def extract_json_from_response(text):
+    """
+    LLM yanıtındaki JSON bölümünü ayıklar.
+    Model bazen JSON'u düz metin veya markdown içinde döndürebilir.
+    """
+    import json
+    import re
+
+    if not text:
+        return None
+
+    # Önce doğrudan JSON olarak dene
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # ```json ... ``` bloğu varsa onu yakala
+    code_block = re.search(r"```json\s*(.*?)```", text, re.DOTALL)
+    if code_block:
+        try:
+            return json.loads(code_block.group(1).strip())
+        except Exception:
+            pass
+
+    # Genel JSON nesnesini yakala
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+    return None
+
+def limit_text_by_keywords(pages, keywords, max_chars=60000):
+    """
+    ESG anahtar kelimelerinin geçtiği sayfaları ve komşu sayfaları seçer.
+    Böylece tablo bir önceki/sonraki sayfadaysa kaçırılmaz.
+    """
+    selected_indexes = set()
+
+    for idx, page in enumerate(pages):
+        text_lower = page["text"].lower()
+
+        if any(k.lower() in text_lower for k in keywords):
+            selected_indexes.add(idx)
+
+            if idx > 0:
+                selected_indexes.add(idx - 1)
+
+            if idx < len(pages) - 1:
+                selected_indexes.add(idx + 1)
+
+    selected = []
+
+    for idx in sorted(selected_indexes):
+        page = pages[idx]
+        selected.append(f"\n--- PAGE {page['page_no']} ---\n{page['text']}")
+
+    combined = "\n".join(selected)
+
+    if not combined.strip():
+        combined = "\n".join(
+            [f"\n--- PAGE {p['page_no']} ---\n{p['text']}" for p in pages[:20]]
+        )
+
+    return combined[:max_chars]
+
+def validate_evidence_against_text(variables_df, report_text):
+    """
+    Evidence sentence birebir bulunmasa bile,
+    değer ve anahtar kelime rapor metninde geçiyorsa kanıtı kabul eder.
+    """
+    if variables_df.empty:
+        return variables_df
+
+    report_text_clean = " ".join(report_text.split()).lower()
+
+    for idx, row in variables_df.iterrows():
+        evidence = str(row.get("evidence_sentence", "")).strip()
+        value = str(row.get("value", "")).strip()
+        variable = str(row.get("variable", "")).strip().lower()
+
+        if not evidence or evidence.lower() in ["not disclosed", "none", "nan"]:
+            variables_df.at[idx, "manual_check"] = "Yes"
+            variables_df.at[idx, "confidence"] = 0
+            variables_df.at[idx, "validation_note"] = "No evidence sentence"
+            continue
+
+        if value.lower() in ["not disclosed", "none", "nan", ""]:
+            variables_df.at[idx, "manual_check"] = "Yes"
+            variables_df.at[idx, "confidence"] = 0
+            variables_df.at[idx, "validation_note"] = "No disclosed value"
+            continue
+
+        evidence_clean = " ".join(evidence.split()).lower()
+
+        value_alt_1 = value.replace(".", "").replace(",", ".")
+        value_alt_2 = value.replace(".", "")
+        value_alt_3 = value.replace(",", ".")
+
+        value_found = (
+            value.lower() in report_text_clean
+            or value_alt_1.lower() in report_text_clean
+            or value_alt_2.lower() in report_text_clean
+            or value_alt_3.lower() in report_text_clean
+        )
+
+        keyword_map = {
+            "scope1_tco2e": ["kapsam 1", "sera gazı", "emisyon"],
+            "scope2_tco2e": ["kapsam 2", "sera gazı", "emisyon"],
+            "scope3_tco2e": ["kapsam 3", "sera gazı", "emisyon"],
+            "total_ghg_tco2e": ["kapsam 1", "kapsam 2", "sera gazı"],
+            "carbon_intensity": ["yoğunluğu", "sera gazı"],
+            "energy_consumption": ["toplam enerji tüketimi"],
+            "water_consumption": ["toplam su tüketimi"],
+            "waste_generated": ["toplam atık miktarı"],
+            "employee_number": ["toplam çalışan sayısı"],
+            "female_employee_ratio": ["kadın", "%"],
+            "female_manager_ratio": ["kadın yönetici oranı"],
+            "training_hours": ["toplam eğitim"],
+            "turnover_rate": ["çalışan devir oranı"],
+            "female_board_ratio": ["yönetim kurulu", "kadın"]
         }
-        50% { 
-            filter: brightness(1.4) hue-rotate(45deg) saturate(1.5);
-            transform: scale(1);
-            text-shadow: 0 0 20px rgba(255, 107, 107, 0.8);
-        }
-        100% { 
-            filter: brightness(1) hue-rotate(0deg) saturate(1);
-            transform: scale(1);
-            text-shadow: 0 0 10px rgba(255, 107, 107, 0.3);
-        }
-    }
-    
-    .workflow-stage {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-        text-align: center;
-    }
-    
-    .agent-instruction {
-        background: #f8f9fa;
-        border: 2px dashed #dee2e6;
-        border-radius: 8px;
-        padding: 0.5rem;
-        margin: 0.5rem 0;
-        font-style: italic;
-        animation: fadeIn 0.5s ease-in;
-    }
-    
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(10px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-    
-    .agent-handoff {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        margin: 1rem 0;
-        font-size: 1.5rem;
-    }
-    
-    .mission-control {
-        background: linear-gradient(135deg, #2d3748 0%, #4a5568 100%);
-        color: white;
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-        max-height: 400px;
-        overflow-y: auto;
-    }
-    
-    .mission-event {
-        background: rgba(255, 255, 255, 0.1);
-        padding: 0.5rem;
-        margin: 0.25rem 0;
-        border-radius: 5px;
-        border-left: 3px solid #4fd1c7;
-        font-size: 0.9rem;
-    }
-</style>""", unsafe_allow_html=True)
 
-def get_agent_emoji(agent_name):
-    """Get fun emojis for each agent"""
-    emojis = {
-        "lead_agent": "🎯",
-        "academic_search": "🎓",
-        "web_search": "🌐", 
-        "data_search": "�",
-        "aggregator": "⚡",
-        "verification_agent": "📝",
-        "synthesis": "🧠"
-    }
-    return emojis.get(agent_name, "🤖")
+        expected_keywords = keyword_map.get(variable, [])
+        keyword_found = any(k in report_text_clean for k in expected_keywords)
 
-def get_agent_personality(agent_name):
-    """Get fun personality descriptions for each agent"""
-    personalities = {
-        "lead_agent": "The Master Orchestrator 🎯\n*Conducting the research symphony*",
-        "academic_search": "The Scholar 🎓\n*Diving deep into research papers*",
-        "web_search": "The News Hound 🌐\n*Sniffing out the latest intel*",
-        "data_search": "The ESG Specialist �\n*Unlocking sustainability insights*",
-        "aggregator": "The Collector ⚡\n*Gathering all the evidence*",
-        "verification_agent": "The Fact Checker 📝\n*Ensuring everything is legit*",
-        "synthesis": "The Mastermind 🧠\n*Weaving it all together*"
-    }
-    return personalities.get(agent_name, "The Mystery Agent 🤖")
+        exact_evidence_found = evidence_clean in report_text_clean
 
-
-def get_agent_avatar(agent_name, status="waiting"):
-    """Get animated avatar for each agent based on status"""
-    avatars = {
-        "lead_agent": "🎭",
-        "academic_search": "🎓", 
-        "web_search": "🌐",
-        "data_search": "�",
-        "aggregator": "🔄",
-        "verification_agent": "📋",
-        "synthesis": "🧠"
-    }
-    
-    emoji = avatars.get(agent_name, "🤖")
-    css_class = f"agent-avatar {status}"
-    
-    return f'<div class="{css_class}">{emoji}</div>'
-
-def get_funny_instruction(from_agent, to_agent):
-    """Get funny instructions between agents"""
-    instructions = {
-        ("lead_agent", "academic_search"): "🎯➡️🎓 'Hey Scholar! Go dig up some brainy papers!'",
-        ("lead_agent", "web_search"): "🎯➡️🌐 'News Hound! Sniff out the latest intel!'", 
-        ("lead_agent", "data_search"): "🎯➡️� 'ESG Specialist! Unlock those sustainability insights!'",
-        ("aggregator", "verification_agent"): "🔄➡️📋 'Fact Checker! Make sure everything checks out!'",
-        ("verification_agent", "synthesis"): "📋➡️🧠 'Mastermind! Work your magic and tie it all together!'"
-    }
-    
-    return instructions.get((from_agent, to_agent), f"🤝 {from_agent} ➡️ {to_agent}")
-def update_mission_control_sidebar():
-    """Update the mission control display in the sidebar"""
-    if 'mission_control_placeholder' in st.session_state and st.session_state.mission_control_placeholder:
-        # Ensure mission_events is initialized
-        if 'mission_events' not in st.session_state:
-            st.session_state.mission_events = []
-            
-        with st.session_state.mission_control_placeholder.container():
-            if st.session_state.mission_events:
-                st.markdown("### 📜 Mission Log")
-                for event in st.session_state.mission_events[-8:]:  # Show last 8 events
-                    st.markdown(f"- {event}")
-            else:
-                st.info("🎬 Awaiting mission deployment...")
-                st.markdown("*Mission updates will appear here during agent execution*")
-
-def get_agent_completed_work(agent_name):
-    """Get the completed work content for a specific agent from session state"""
-    # Try to get from session state
-    agent_work_key = f"agent_work_{agent_name}"
-    if agent_work_key in st.session_state:
-        return st.session_state[agent_work_key]
-    
-    # Fallback descriptions if no specific content available
-    fallback_descriptions = {
-        "lead_agent": "Analyzed the research query and coordinated the multi-agent workflow. Broke down the complex ESG research question into specific subtasks for specialized agents.",
-        "academic_search": "Searched academic databases and research papers for relevant ESG literature. Found scholarly articles and studies related to the query.",
-        "web_search": "Gathered current market intelligence and recent news related to ESG developments. Collected real-time information to complement academic sources.",
-        "data_search": "Accessed the indexed ESG document repository via Azure AI Search. Retrieved relevant sustainability reports, ESG frameworks, and regulatory documents.",
-        "aggregator": "Compiled and organized all research findings from the specialized search agents. Structured the information for quality control and synthesis.",
-        "verification_agent": "Verified all sources and ensured proper attribution for academic papers, ESG reports, and market data. Maintained research integrity standards.",
-        "synthesis": "Integrated all research findings into a comprehensive ESG analysis. Wove together insights from academic sources, market intelligence, and sustainability documents into the final report."
-    }
-    
-    return fallback_descriptions.get(agent_name, "Completed assigned research task successfully.")
-
-def display_workflow_stage(stage_name, description):
-    """Display workflow stage with nice styling"""
-    st.markdown(f"""
-    <div class="workflow-stage">
-        <h3>🎬 {stage_name}</h3>
-        <p>{description}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-def run_workflow_with_visualization(query):
-    """Run the workflow and visualize each step with dynamic agent appearance"""
-    
-    # Create containers for different sections
-    workflow_container = st.container()
-    stage_container = st.container()
-    results_container = st.container()
-    
-    with workflow_container:
-        st.markdown("## 🎬 Multi-Agent Research Mission")
-        st.markdown(f"**🎯 Mission Brief:** *{query}*")
-        st.markdown("---")
-    
-    agent_names = [
-        "lead_agent", "academic_search", "web_search", 
-        "data_search", "aggregator", "verification_agent", "synthesis"
-    ]
-    
-    # Track active agents and their order of appearance
-    active_agents = []
-    completed_agents = []
-    agent_containers = {}
-    
-    # Create the workflow
-    app = create_research_workflow()
-    
-    # Initialize state
-    initial_state = {
-        "messages": [HumanMessage(content=query)],
-        "user_query": query,
-        "subtasks": [],
-        "search_results": [],
-        "verifications": [],
-        "final_report": ""
-    }
-    
-    # Main stage area for dynamic agent display
-    with stage_container:
-        st.markdown("### 🎭 Mission Control Center")
-        
-        # Mission briefing
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                    color: white; padding: 1rem; border-radius: 10px; text-align: center; margin: 1rem 0;">
-            <h4>🚀 Initializing Multi-Agent Research Protocol</h4>
-            <p><em>Deploying specialized AI agents for comprehensive analysis...</em></p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Dynamic stage area
-        stage_placeholder = st.empty()
-        
-        # Progress tracking
-        progress_container = st.container()
-        with progress_container:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-    
-    # Execute workflow with cinematic visualization
-    result = None
-    step_count = 0
-    total_steps = len(agent_names)
-    
-    # Initialize mission events in session state
-    if 'mission_events' not in st.session_state:
-        st.session_state.mission_events = []
-    
-    # Clear previous mission events for new workflow
-    st.session_state.mission_events = []
-    
-    status_text.text("🎬 Mission briefing complete. Deploying first agent...")
-    
-    for step in app.stream(initial_state):
-        step_count += 1
-        node_name = list(step.keys())[0] if step else "unknown"
-        step_data = step.get(node_name, {})
-        
-        # Update progress
-        progress = min(step_count / total_steps, 1.0)
-        progress_bar.progress(progress)
-        
-        # Get agent response content
-        content = ""
-        if "messages" in step_data and step_data["messages"]:
-            latest_message = step_data["messages"][-1]
-            if hasattr(latest_message, 'content'):
-                content = latest_message.content
-        
-        # Add agent to active list if not already there
-        if node_name not in active_agents and node_name in agent_names:
-            active_agents.append(node_name)
-            
-            # Create dramatic agent introduction
-            emoji = get_agent_emoji(node_name)
-            agent_title = node_name.replace('_', ' ').title()
-            
-            # Add mission event
-            if node_name == "lead_agent":
-                st.session_state.mission_events.append(f"🎯 **Mission Commander** {emoji} **{agent_title}** has taken command!")
-                update_mission_control_sidebar()
-                status_text.text(f"🎭 {agent_title} is analyzing the mission parameters...")
-            elif node_name in ["academic_search", "web_search", "data_search"]:
-                st.session_state.mission_events.append(f"📡 **Field Agent** {emoji} **{agent_title}** has been deployed!")
-                update_mission_control_sidebar()
-                status_text.text(f"🔍 {agent_title} is gathering intelligence...")
-            elif node_name == "aggregator":
-                st.session_state.mission_events.append(f"📊 **Intelligence Analyst** {emoji} **{agent_title}** is compiling findings!")
-                update_mission_control_sidebar()
-                status_text.text(f"🔄 {agent_title} is processing all collected data...")
-            elif node_name == "verification_agent":
-                st.session_state.mission_events.append(f"✅ **Quality Controller** {emoji} **{agent_title}** is verifying sources!")
-                update_mission_control_sidebar()
-                status_text.text(f"📋 {agent_title} is fact-checking all intelligence...")
-            elif node_name == "synthesis":
-                st.session_state.mission_events.append(f"🧠 **Master Strategist** {emoji} **{agent_title}** is crafting the final report!")
-                update_mission_control_sidebar()
-                status_text.text(f"🎨 {agent_title} is weaving everything together...")
-        
-        # Update the dynamic stage with current workflow state
-        with stage_placeholder.container():
-            display_cinematic_workflow(active_agents, completed_agents, node_name, content)
-        
-        # Mark agent as complete and store their work
-        if node_name in active_agents and node_name not in completed_agents:
-            completed_agents.append(node_name)
-            agent_title = node_name.replace('_', ' ').title()
-            emoji = get_agent_emoji(node_name)
-            st.session_state.mission_events.append(f"✅ **{agent_title}** {emoji} mission complete! Excellent work!")
-            update_mission_control_sidebar()
-            
-            # Store the agent's work content for later display
-            if content:
-                st.session_state[f"agent_work_{node_name}"] = content
-        
-        result = step_data
-        time.sleep(0.8)  # Dramatic pause for effect
-    
-    # Final celebration
-    progress_bar.progress(1.0)
-    status_text.text("🎉 🏆 MISSION ACCOMPLISHED! All agents have completed their objectives!")
-    
-    # Final display showing all agents completed
-    with stage_placeholder.container():
-        st.markdown("### 🏆 Mission Complete - All Agents Successful!")
-        display_cinematic_workflow([], agent_names, "complete", "Mission accomplished!")
-    
-    # Final mission event
-    st.session_state.mission_events.append("🏆 **OPERATION COMPLETE**: All agents deployed successfully!")
-    update_mission_control_sidebar()
-    
-    # Display final results
-    with results_container:
-        st.markdown("---")
-        st.markdown("## 📊 Final Research Report")
-        
-        if result and "messages" in result and result["messages"]:
-            final_message = result["messages"][-1]
-            if hasattr(final_message, 'content'):
-                st.markdown("### 🎯 Executive Summary")
-                st.success("Research completed successfully! Here's what our agents discovered:")
-                
-                # Display the final synthesis in a nice format
-                st.markdown("### 📋 Comprehensive Analysis")
-                st.markdown(final_message.content)
-                
-                # Add some fun stats
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Agents Deployed", len(agent_names))
-                with col2:
-                    st.metric("Research Steps", step_count)
-                with col3:
-                    st.metric("Words Generated", len(final_message.content.split()))
-                with col4:
-                    st.metric("Characters", len(final_message.content))
-                
-                # Download options
-                st.markdown("### 📥 Download Options")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.download_button(
-                        label="📄 Download as Text",
-                        data=final_message.content,
-                        file_name=f"stress_test_research_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                        mime="text/plain",
-                        use_container_width=True
-                    )
-                
-                with col2:
-                    try:
-                        pdf_report = generate_pdf_report(
-                            query=st.session_state.query, 
-                            final_content=final_message.content, 
-                            agent_count=len(agent_names), 
-                            step_count=step_count
-                        )
-                        st.download_button(
-                            label="📑 Download as PDF",
-                            data=pdf_report,
-                            file_name=f"stress_test_research_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True
-                        )
-                    except ImportError:
-                        st.error("📑 PDF generation requires reportlab")
-                        st.info("💡 Install with: pip install reportlab")
-                    except Exception as e:
-                        st.error(f"📑 PDF generation failed: {str(e)}")
-                        st.info("💡 Text download is still available above")
-            else:
-                st.error("❌ No final report generated")
+        if exact_evidence_found or (value_found and keyword_found):
+            variables_df.at[idx, "manual_check"] = "No"
+            variables_df.at[idx, "confidence"] = 90
+            variables_df.at[idx, "validation_note"] = "Evidence/value found in selected report text"
         else:
-            st.error("❌ Research failed to complete")
-    
-    return result
+            variables_df.at[idx, "manual_check"] = "Yes"
+            variables_df.at[idx, "confidence"] = 0
+            variables_df.at[idx, "validation_note"] = "Evidence sentence not found in selected report text"
 
-def display_cinematic_workflow(active_agents, completed_agents, current_agent, current_content):
-    """Display the workflow in a cinematic, step-by-step manner"""
-    
-    # Handle special case where workflow is complete
-    if current_agent == "complete":
-        # Show all agents as completed in final state
-        completed_agents = ["lead_agent", "academic_search", "web_search", "data_search", "aggregator", "verification_agent", "synthesis"]
-        active_agents = []
-    
-    # Show agents in order of workflow progression
-    workflow_stages = [
-        {"stage": "🎯 Command Center", "agents": ["lead_agent"]},
-        {"stage": "🔍 Intelligence Gathering", "agents": ["academic_search", "web_search", "data_search"]},
-        {"stage": "📊 Analysis & Quality Control", "agents": ["aggregator", "verification_agent"]},
-        {"stage": "🧠 Strategic Synthesis", "agents": ["synthesis"]}
-    ]
-    
-    for stage_info in workflow_stages:
-        stage_name = stage_info["stage"]
-        stage_agents = stage_info["agents"]
-        
-        # Check if any agent in this stage is active or completed
-        stage_active = any(agent in active_agents for agent in stage_agents)
-        stage_completed = any(agent in completed_agents for agent in stage_agents)
-        
-        # Show stage if it's active or completed (for final display)
-        if stage_active or stage_completed:
-            st.markdown(f"### {stage_name}")
-            
-            # Display agents in this stage
-            if len(stage_agents) == 1:
-                # Single agent - centered display
-                agent = stage_agents[0]
-                if agent in active_agents or agent in completed_agents:
-                    col1, col2, col3 = st.columns([1, 2, 1])
-                    with col2:
-                        display_agent_spotlight(agent, current_agent, current_content, completed_agents)
-            else:
-                # Multiple agents - grid display
-                cols = st.columns(len(stage_agents))
-                for i, agent in enumerate(stage_agents):
-                    if agent in active_agents or agent in completed_agents:
-                        with cols[i]:
-                            display_agent_spotlight(agent, current_agent, current_content, completed_agents)
-            
-            # Show handoff animations between stages
-            if stage_name == "🎯 Command Center" and "lead_agent" in completed_agents:
-                st.markdown("""
-                <div style="text-align: center; font-size: 1.5rem; margin: 2rem 0;">
-                    🎯 ➡️ 📡 <em>"Deploy the field team! Fan out and gather intelligence!"</em>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            elif stage_name == "🔍 Intelligence Gathering" and all(agent in completed_agents for agent in ["academic_search", "web_search", "data_search"]):
-                st.markdown("""
-                <div style="text-align: center; font-size: 1.5rem; margin: 2rem 0;">
-                    📡 ➡️ 📊 <em>"Intelligence gathered! Sending to analysis division..."</em>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            elif stage_name == "📊 Analysis & Quality Control" and "verification_agent" in completed_agents:
-                st.markdown("""
-                <div style="text-align: center; font-size: 1.5rem; margin: 2rem 0;">
-                    📊 ➡️ 🧠 <em>"Analysis complete! Deploying master strategist..."</em>
-                </div>
-                """, unsafe_allow_html=True)
+    return variables_df
 
-def display_agent_spotlight(agent_name, current_agent, current_content, completed_agents):
-    """Display individual agent in spotlight with current status"""
-    emoji = get_agent_emoji(agent_name)
-    personality = get_agent_personality(agent_name)
-    agent_title = agent_name.replace('_', ' ').title()
-    
-    # Determine status
-    if agent_name == current_agent:
-        status = "active"
-        status_icon = "🔄"
-        status_text = "ACTIVE"
-        status_color = "#ff6b6b"
-        border_animation = "border: 3px solid #ff6b6b; animation: pulse 1s infinite;"
-    elif agent_name in completed_agents:
-        status = "complete"
-        status_icon = "✅"
-        status_text = "COMPLETE"
-        status_color = "#00b894"
-        border_animation = "border: 3px solid #00b894;"
+def get_llm():
+    if not OPENAI_API_KEY:
+        st.error("OPENAI_API_KEY bulunamadı. .env dosyasına OPENAI_API_KEY ekleyiniz.")
+        st.stop()
+
+    return ChatOpenAI(
+        model=OPENAI_MODEL,
+        temperature=0.2
+    )
+def select_text_by_page_range(pages, start_page, end_page, max_chars=60000):
+    """
+    Belirli sayfa aralığındaki metni seçer.
+    Özellikle uzun sürdürülebilirlik raporlarında performans tablolarını yakalamak için kullanılır.
+    """
+    selected = []
+
+    for page in pages:
+        if start_page <= page["page_no"] <= end_page:
+            selected.append(f"\n--- PAGE {page['page_no']} ---\n{page['text']}")
+
+    combined = "\n".join(selected)
+
+    if not combined.strip():
+        return ""
+
+    return combined[:max_chars]
+
+def create_extraction_prompt(company, year, report_text):
+    return f"""
+Sen bir ESG veri çıkarım ve sürdürülebilirlik raporu analiz agentısın.
+
+Görevin, verilen sürdürülebilirlik / entegre faaliyet / TSRS raporu metninden ESG değişkenlerini çıkarmaktır.
+
+Kurallar:
+1. Sadece metinde açıkça verilen bilgileri çıkar.
+2. Tahmin yapma.
+3. Değer yoksa "Not disclosed" yaz.
+4. Her değer için kanıt cümlesi ver.
+5. Her değer için sayfa numarası varsa belirt.
+6. Birim, yıl ve güven skorunu ayrıca yaz.
+7. Greenwashing için kesin hüküm verme; yalnızca risk skoru üret.
+8. Çıktıyı SADECE geçerli JSON olarak ver. Markdown kullanma.
+9. Türkçe raporlarda Scope 1 yerine "Kapsam 1", Scope 2 yerine "Kapsam 2", Scope 3 yerine "Kapsam 3" ifadeleri geçebilir.
+10. "sera gazı emisyonları", "karbon emisyonları", "CO₂e", "tCO₂e" ifadelerini emisyon değişkenleri için dikkate al.
+11. Tablolarda verilen sayısal değerleri de çıkar.
+12. Bir değer tabloda varsa ve cümle yoksa evidence_sentence alanına tablo satırının açıklamasını yaz.
+13. Sayı Türkçe formatta verilmişse, örneğin 6.172.417, bunu aynen koru.
+14. Eğer değer rapor metninde açıkça yoksa kesinlikle örnek veya tahmini değer üretme.
+15. "olarak belirtilmiştir" gibi genel kanıt cümlesi yazma; evidence_sentence alanı rapor metninden aynen alınmış gerçek cümle veya tablo satırı olmalıdır.
+16. evidence_sentence alanındaki metin, verilen rapor metninde birebir bulunmalıdır.
+17. Eğer evidence_sentence rapor metninden birebir alınamıyorsa value alanına "Not disclosed", confidence alanına 0, manual_check alanına "Yes" yaz.
+18. confidence alanı 0-100 aralığında olmalıdır. Açıkça bulunan değerlerde 80-100, bulunmayanlarda 0 yaz.
+19. net_zero_target değişkeni için değer sadece "Yes", "No" veya "Not disclosed" olmalıdır. Hedef yılı ayrı olarak target_year değişkenine yaz.
+
+Şirket: {company}
+Yıl: {year}
+
+Çıkarılacak değişkenler:
+
+Çevresel:
+- scope1_tco2e
+- scope2_tco2e
+- scope3_tco2e
+- total_ghg_tco2e
+- carbon_intensity
+- energy_consumption
+- renewable_energy_ratio
+- water_consumption
+- waste_generated
+- net_zero_target
+- target_year
+
+Sosyal:
+- employee_number
+- female_employee_ratio
+- female_manager_ratio
+- training_hours
+- ltifr
+- accident_rate
+- turnover_rate
+- human_rights_policy
+
+Yönetişim:
+- board_independence_ratio
+- female_board_ratio
+- esg_committee
+- ethics_policy
+- anti_corruption_policy
+- whistleblowing_mechanism
+- esg_incentive
+
+Metinsel skorlar:
+- vague_statement_ratio
+- quantitative_evidence_ratio
+- evidence_backed_claim_ratio
+- gri_score
+- tcfd_score
+
+JSON şeması:
+
+{{
+  "company": "{company}",
+  "year": "{year}",
+  "extracted_variables": [
+    {{
+      "variable": "",
+      "value": "",
+      "unit": "",
+      "evidence_sentence": "",
+      "page_no": "",
+      "confidence": 0,
+      "manual_check": "Yes/No"
+    }}
+  ],
+  "textual_scores": {{
+    "vague_statement_ratio": 0,
+    "quantitative_evidence_ratio": 0,
+    "evidence_backed_claim_ratio": 0,
+    "gri_score": 0,
+    "tcfd_score": 0
+  }},
+  "short_assessment": ""
+}}
+
+Rapor metni:
+{report_text}
+"""
+
+
+def calculate_scores(textual_scores):
+    vague = float(textual_scores.get("vague_statement_ratio", 0) or 0)
+    quant = float(textual_scores.get("quantitative_evidence_ratio", 0) or 0)
+    evidence = float(textual_scores.get("evidence_backed_claim_ratio", 0) or 0)
+    gri = float(textual_scores.get("gri_score", 0) or 0)
+    tcfd = float(textual_scores.get("tcfd_score", 0) or 0)
+
+    text_index = (quant + evidence + (100 - vague)) / 3
+    greenwashing_score = 0.40 * vague + 0.30 * (100 - quant) + 0.30 * (100 - evidence)
+
+    if greenwashing_score <= 33:
+        risk_level = "Düşük"
+    elif greenwashing_score <= 66:
+        risk_level = "Orta"
     else:
-        status = "waiting"
-        status_icon = "⏳"
-        status_text = "STANDBY"
-        status_color = "#636e72"
-        border_animation = "border: 3px dashed #636e72;"
-    
-    # Create agent card with animations
-    st.markdown(f"""
-    <div style="
-        {border_animation}
-        background: linear-gradient(135deg, rgba(255,255,255,0.9) 0%, rgba(240,240,240,0.9) 100%);
-        border-radius: 15px;
-        padding: 1.5rem;
-        text-align: center;
-        margin: 1rem 0;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-    ">
-        <div style="font-size: 4rem; margin-bottom: 1rem;">
-            {emoji}
-        </div>
-        <h4 style="margin: 0.5rem 0; color: #2c3e50;">{agent_title}</h4>
-        <p style="color: #7f8c8d; font-style: italic; margin: 0.5rem 0;">
-            {personality.split('\\n')[1] if '\\n' in personality else personality}
-        </p>
-        <div style="
-            background-color: {status_color};
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-weight: bold;
-            margin-top: 1rem;
-        ">
-            {status_icon} {status_text}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Show current thinking for active agent
-    if agent_name == current_agent and current_content:
-        with st.expander(f"🧠 {agent_title} Current Analysis", expanded=True):
-            # Show first 500 chars of content
-            preview = current_content[:500] + "..." if len(current_content) > 500 else current_content
-            st.markdown(f"*{preview}*")
-            
-            # Add thinking animation
-            st.markdown("""
-            <div style="text-align: center; margin: 1rem 0;">
-                <em style="color: #7f8c8d;">🤔 Processing... 💭 Analyzing... 🔍 Synthesizing...</em>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Show completed work for finished agents - always available to expand
-    elif agent_name in completed_agents:
-        # Get the completed work from session state if available
-        completed_work = get_agent_completed_work(agent_name)
-        
-        with st.expander(f"📋 {agent_title} Completed Work", expanded=False):
-            if completed_work:
-                st.markdown("**🎯 Mission Summary:**")
-                # Show first 800 chars with option to see more
-                if len(completed_work) > 800:
-                    preview = completed_work[:800] + "..."
-                    st.markdown(f"*{preview}*")
-                    
-                    # Use session state to track expanded reports
-                    expand_key = f"expand_report_{agent_name}"
-                    if expand_key not in st.session_state:
-                        st.session_state[expand_key] = False
-                    
-                    # Create a unique key that includes agent name and a hash of content
-                    import hashlib
-                    content_hash = hashlib.md5(completed_work.encode()).hexdigest()[:8]
-                    unique_key = f"full_report_{agent_name}_{content_hash}"
-                    
-                    # Use expander instead of checkbox to avoid duplicate key issues
-                    with st.expander("📖 Show Full Report", expanded=st.session_state[expand_key]):
-                        st.markdown("**📄 Complete Analysis:**")
-                        st.markdown(f"*{completed_work}*")
-                else:
-                    st.markdown(f"*{completed_work}*")
-                
-                # Add some fun completion metrics
-                word_count = len(completed_work.split())
-                char_count = len(completed_work)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Words Generated", word_count)
-                with col2:
-                    st.metric("Characters", char_count)
-                    
-                st.success(f"✅ {agent_title} mission accomplished!")
-            else:
-                st.info(f"🔄 {agent_title} completed their task. Detailed results will be available in the final report.")
-                st.markdown("""
-                <div style="text-align: center; margin: 1rem 0;">
-                    <em style="color: #7f8c8d;">🎉 Task completed successfully! 🏆</em>
-                </div>
-                """, unsafe_allow_html=True)
+        risk_level = "Yüksek"
 
-def generate_pdf_report(query, final_content, agent_count, step_count):
-    """Generate a professional PDF report of the research findings"""
-    
-    # Create a bytes buffer to store the PDF
-    buffer = io.BytesIO()
-    
-    # Create the PDF document
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=18
-    )
-    
-    # Get styles
-    styles = getSampleStyleSheet()
-    
-    # Custom styles
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        spaceAfter=30,
-        textColor=HexColor('#2E86AB'),
-        alignment=1  # Center alignment
-    )
-    
-    subtitle_style = ParagraphStyle(
-        'CustomSubtitle',
-        parent=styles['Heading2'],
-        fontSize=16,
-        spaceAfter=20,
-        textColor=HexColor('#F24236'),
-        alignment=1
-    )
-    
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=12,
-        textColor=HexColor('#2E86AB'),
-        spaceBefore=20
-    )
-    
-    body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['Normal'],
-        fontSize=11,
-        spaceAfter=12,
-        alignment=0,  # Left alignment
-        leftIndent=0,
-        rightIndent=0
-    )
-    
-    metadata_style = ParagraphStyle(
-        'MetadataStyle',
-        parent=styles['Normal'],
-        fontSize=10,
-        textColor=HexColor('#636e72'),
-        spaceAfter=6
-    )
-    
-    # Build the story (content)
-    story = []
-    
-    # Title page
-    story.append(Paragraph("ESG Research & Reporting System", title_style))
-    story.append(Spacer(1, 20))
-    story.append(Paragraph("Multi-Agent Research Report", subtitle_style))
-    story.append(Spacer(1, 40))
-    
-    # Query and metadata
-    story.append(Paragraph("Research Query", heading_style))
-    story.append(Paragraph(f"<i>{query}</i>", body_style))
-    story.append(Spacer(1, 20))
-    
-    # Report metadata
-    story.append(Paragraph("Report Metadata", heading_style))
-    current_time = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-    story.append(Paragraph(f"<b>Generated:</b> {current_time}", metadata_style))
-    story.append(Paragraph(f"<b>Agents Deployed:</b> {agent_count}", metadata_style))
-    story.append(Paragraph(f"<b>Processing Steps:</b> {step_count}", metadata_style))
-    story.append(Paragraph(f"<b>Report Length:</b> {len(final_content.split())} words", metadata_style))
-    story.append(Paragraph(f"<b>System:</b> Azure OpenAI + LangGraph Multi-Agent Framework", metadata_style))
-    
-    story.append(PageBreak())
-    
-    # Executive Summary
-    story.append(Paragraph("Executive Summary", heading_style))
-    
-    # Extract first paragraph as summary if the content is long
-    paragraphs = final_content.split('\n\n')
-    if len(paragraphs) > 1 and len(final_content) > 500:
-        summary = paragraphs[0] if len(paragraphs[0]) > 100 else paragraphs[0] + " " + paragraphs[1]
-        story.append(Paragraph(f"<i>{summary}</i>", body_style))
-        story.append(Spacer(1, 20))
-    
-    # Main findings
-    story.append(Paragraph("Comprehensive Analysis", heading_style))
-    
-    # Split content into paragraphs and format them
-    content_paragraphs = final_content.split('\n')
-    
-    for para in content_paragraphs:
-        if para.strip():
-            # Clean up markdown formatting properly
-            clean_para = para.strip()
-            
-            # Handle bold formatting - convert **text** to <b>text</b>
-            import re
-            clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean_para)
-            
-            # Handle italic formatting - convert *text* to <i>text</i>
-            clean_para = re.sub(r'\*(.*?)\*', r'<i>\1</i>', clean_para)
-            
-            # Escape any remaining problematic characters
-            clean_para = clean_para.replace('&', '&amp;')
-            clean_para = clean_para.replace('<', '&lt;').replace('>', '&gt;')
-            
-            # Restore the HTML tags we want to keep
-            clean_para = clean_para.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-            clean_para = clean_para.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
-            
-            # Check if it's a heading (starts with #, numbers, or is short and in caps)
-            if (clean_para.startswith('#') or 
-                clean_para.startswith(('1.', '2.', '3.', '4.', '5.')) or
-                (len(clean_para) < 80 and clean_para.isupper()) or
-                clean_para.startswith('<b>') and clean_para.endswith('</b>') and len(clean_para) < 100):
-                # Format as a sub-heading
-                heading_text = clean_para.replace('#', '').replace('<b>', '').replace('</b>', '').strip()
-                story.append(Paragraph(f"<b>{heading_text}</b>", heading_style))
-            else:
-                # Regular paragraph
-                try:
-                    story.append(Paragraph(clean_para, body_style))
-                except Exception as e:
-                    # If there's still a parsing error, fall back to plain text
-                    plain_text = re.sub(r'<[^>]+>', '', clean_para)  # Remove all HTML tags
-                    story.append(Paragraph(plain_text, body_style))
-            
-            story.append(Spacer(1, 6))
-    
-    # Footer section
-    story.append(Spacer(1, 30))
-    story.append(Paragraph("Research Methodology", heading_style))
-    methodology_text = """
-    This report was generated using a sophisticated multi-agent AI research system that coordinates
-    specialized agents to conduct comprehensive ESG analysis:
-    
-    • Academic Search Agent: Analyzed scholarly papers from arXiv database
-    • Web Search Agent: Gathered current market intelligence via Brave Search API  
-    • Data Search Agent: Accessed indexed ESG documents via Azure AI Search
-    • Verification Agent: Verified sources and ensured proper attribution
-    • Synthesis Agent: Integrated findings into this comprehensive report
-    
-    All findings are based on authoritative sources including ESG frameworks (GRI, SASB, TCFD),
-    academic research, and current sustainability data.
-    """
-    story.append(Paragraph(methodology_text, body_style))
-    
-    # Disclaimer
-    story.append(Spacer(1, 20))
-    story.append(Paragraph("Disclaimer", heading_style))
-    disclaimer_text = """
-    This report is generated by AI for research and informational purposes only. 
-    It should not be considered as financial advice or regulatory guidance. 
-    Always consult with qualified financial professionals for investment and risk management decisions.
-    """
-    story.append(Paragraph(disclaimer_text, metadata_style))
-    
-    # Build the PDF
-    doc.build(story)
-    
-    # Get the PDF bytes
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-    
-    return pdf_bytes
+    return {
+        "vague_statement_ratio": vague,
+        "quantitative_evidence_ratio": quant,
+        "evidence_backed_claim_ratio": evidence,
+        "gri_score": gri,
+        "tcfd_score": tcfd,
+        "TEXTIndex": round(text_index, 2),
+        "Greenwashing_Risk_Score": round(greenwashing_score, 2),
+        "Risk_Level": risk_level
+    }
 
-def main():
-    """Main Streamlit app"""
-    
-    # Header
-    st.title("� ESG Research & Reporting System")
-    st.markdown("### 🤖 Powered by Multi-Agent AI • Azure OpenAI • LangGraph")
-    st.markdown("---")
-    
-    # Sidebar with sample queries
-    with st.sidebar:
-        st.markdown("## 💡 Try These Examples")
-        st.markdown("Ask about companies in our database:")
-        
-        sample_queries = [
-            # Simple, accessible questions about companies in our index
-            "How is Microsoft reducing their carbon emissions?",
-            "What are Apple's environmental goals and progress?",
-            "Compare the sustainability efforts of BP and Unilever",
-            "What green initiatives is HSBC funding?",
-            "Show me PepsiCo's progress on sustainability targets"
-        ]
-        
-        for i, sample in enumerate(sample_queries, 1):
-            # Use shorter button labels but full query text
-            button_labels = [
-                "🍃 Microsoft Carbon Goals",
-                "🌱 Apple Environmental Progress", 
-                "⚖️ Compare BP vs Unilever",
-                "💚 HSBC Green Funding",
-                "🎯 PepsiCo Sustainability"
+
+def create_excel(company, year, variables_df, scores_df, assessment):
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        variables_df.to_excel(writer, index=False, sheet_name="Kanitli_ESG_Verileri")
+        scores_df.to_excel(writer, index=False, sheet_name="Metinsel_Skorlar")
+
+        notes_df = pd.DataFrame({
+            "Alan": [
+                "Şirket",
+                "Yıl",
+                "Kısa Değerlendirme",
+                "TEXTIndex Formülü",
+                "Greenwashing Risk Formülü",
+                "Not"
+            ],
+            "Açıklama": [
+                company,
+                year,
+                assessment,
+                "(QuantitativeEvidence + EvidenceBacked + (100 - Vague)) / 3",
+                "0.40*Vague + 0.30*(100-QuantitativeEvidence) + 0.30*(100-EvidenceBacked)",
+                "AI çıktıları akademik kullanım öncesinde rapor sayfası ve kanıt cümlesiyle manuel doğrulanmalıdır."
             ]
-            
-            if st.button(button_labels[i-1], key=f"sample_{i}", use_container_width=True):
-                st.session_state.query = sample
-        
-        st.markdown("---")
-        st.markdown("## 📊 Available Companies")
-        st.markdown("Our database includes ESG reports from:")
-        st.markdown("""
-        • **Microsoft** - Environmental sustainability reports
-        • **Apple** - Environmental progress reports  
-        • **HSBC** - ESG reviews and green bonds
-        • **BP** - Sustainability and ESG datasheets
-        • **Unilever** - Annual reports and climate action
-        • **PepsiCo** - ESG summaries and green bonds
-        """)
-        
-        st.markdown("---")
-        st.markdown("## 🎛️ Mission Control")
-        
-        # Mission control updates will be displayed here during workflow execution
-        mission_control_placeholder = st.empty()
-        
-        # Initialize mission control display
-        if 'mission_control_placeholder' not in st.session_state:
-            st.session_state.mission_control_placeholder = mission_control_placeholder
-        
-        # Initialize mission events if not already done
-        if 'mission_events' not in st.session_state:
-            st.session_state.mission_events = []
-        
-        # Display current mission events
-        with mission_control_placeholder.container():
-            if st.session_state.mission_events:
-                st.markdown("### 📜 Mission Log")
-                for event in st.session_state.mission_events[-8:]:  # Show last 8 events
-                    st.markdown(f"- {event}")
-            else:
-                st.info("🎬 Awaiting mission deployment...")
-                st.markdown("*Mission updates will appear here during agent execution*")
-    
-    # Main query input
-    st.markdown("## 🔍 Research Query")
-    query = st.text_area(
-        "Enter your ESG research question:",
-        value=st.session_state.get('query', ''),
-        height=100,
-        placeholder="e.g., What are the latest ESG disclosure requirements for sustainability reporting?"
-    )
-    
-    # Run button
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        if st.button("🚀 Launch Research Mission", type="primary", use_container_width=True):
-            if query.strip():
-                st.session_state.query = query
-                st.rerun()
-            else:
-                st.error("Please enter a research query!")
-    
-    # Run the workflow if query is provided and results not already cached
-    if 'query' in st.session_state and st.session_state.query.strip():
-        # Check if we already have results for this query
-        if ('results' not in st.session_state or 
-            st.session_state.get('last_query') != st.session_state.query):
-            
-            # Run the workflow and cache results
-            with st.container():
-                result = run_workflow_with_visualization(st.session_state.query)
-                st.session_state.results = result
-                st.session_state.last_query = st.session_state.query
-        else:
-            # Display cached results
-            st.markdown("## 📊 Research Results (Cached)")
-            st.info("🎯 Results loaded from cache. Click 'Start New Research' to run a new query.")
-            
-            result = st.session_state.results
-            
-            # Display the cached final results
-            if result and "messages" in result and result["messages"]:
-                final_message = result["messages"][-1]
-                if hasattr(final_message, 'content'):
-                    st.markdown("### 📋 Comprehensive Analysis")
-                    st.markdown(final_message.content)
-                    
-                    # Add metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    agent_names = [
-                        "lead_agent", "academic_search", "web_search", 
-                        "data_search", "aggregator", "verification_agent", "synthesis"
-                    ]
-                    with col1:
-                        st.metric("Agents Deployed", len(agent_names))
-                    with col2:
-                        st.metric("Research Steps", len(result["messages"]))
-                    with col3:
-                        st.metric("Words Generated", len(final_message.content.split()))
-                    with col4:
-                        st.metric("Characters", len(final_message.content))
-                    
-                    # Download options
-                    st.markdown("### 📥 Download Options")
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.download_button(
-                            label="� Download as Text",
-                            data=final_message.content,
-                            file_name=f"stress_test_research_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                            mime="text/plain",
-                            use_container_width=True,
-                            key="cached_txt_download"
-                        )
-                    
-                    with col2:
-                        try:
-                            pdf_report = generate_pdf_report(
-                                query=st.session_state.query, 
-                                final_content=final_message.content, 
-                                agent_count=len(agent_names), 
-                                step_count=len(result["messages"])
-                            )
-                            st.download_button(
-                                label="📑 Download as PDF",
-                                data=pdf_report,
-                                file_name=f"stress_test_research_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                                mime="application/pdf",
-                                use_container_width=True,
-                                key="cached_pdf_download"
-                            )
-                        except ImportError:
-                            st.error("📑 PDF generation requires reportlab")
-                            st.info("💡 Install with: pip install reportlab")
-                        except Exception as e:
-                            st.error(f"📑 PDF generation failed: {str(e)}")
-                            st.info("💡 Text download is still available above")
-        
-        # Clear query button
-        if st.button("🔄 Start New Research", type="secondary"):
-            # Clear all session state including agent work and mission events
-            keys_to_clear = ['query', 'results', 'last_query', 'mission_events']
-            # Also clear any stored agent work
-            agent_work_keys = [key for key in st.session_state.keys() if key.startswith('agent_work_')]
-            keys_to_clear.extend(agent_work_keys)
-            
-            for key in keys_to_clear:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
+        })
+        notes_df.to_excel(writer, index=False, sheet_name="Notlar")
 
-if __name__ == "__main__":
-    main()
+    output.seek(0)
+    return output
+def select_text_by_page_range(pages, start_page, end_page, max_chars=60000):
+    selected = []
+
+    for page in pages:
+        if start_page <= page["page_no"] <= end_page:
+            selected.append(f"\n--- PAGE {page['page_no']} ---\n{page['text']}")
+
+    combined = "\n".join(selected)
+    return combined[:max_chars]
+
+
+# =========================
+# SIDEBAR
+# =========================
+
+st.sidebar.header("⚙️ Ayarlar")
+
+company = st.sidebar.text_input("Şirket adı", value="Tüpraş")
+year = st.sidebar.text_input("Rapor yılı", value="2024")
+
+keywords_input = st.sidebar.text_area(
+    "Aranacak anahtar kelimeler",
+    value="Scope 1, Scope 2, Scope 3, emissions, enerji, energy, renewable, yenilenebilir, net zero, net sıfır, GRI, TCFD, TSRS, female, kadın, employee, çalışan, ethics, etik, board, yönetim"
+)
+
+
+max_chars = st.sidebar.slider(
+    "LLM'e gönderilecek maksimum karakter",
+    min_value=10000,
+    max_value=60000,
+    value=60000,
+    step=5000
+)
+
+start_page = st.sidebar.number_input("Başlangıç sayfası", min_value=1, value=376)
+end_page = st.sidebar.number_input("Bitiş sayfası", min_value=1, value=412)
+
+# =========================
+# MAIN
+# =========================
+
+uploaded_file = st.file_uploader(
+    "Sürdürülebilirlik / Entegre Faaliyet / TSRS rapor PDF dosyasını yükleyin",
+    type=["pdf"]
+)
+
+if uploaded_file is not None:
+    st.success(f"PDF yüklendi: {uploaded_file.name}")
+
+    with st.spinner("PDF metni okunuyor..."):
+        pages = read_pdf_text(uploaded_file)
+
+    st.info(f"Toplam metin çıkarılan sayfa sayısı: {len(pages)}")
+
+    report_text = select_text_by_page_range(
+        pages,
+        start_page=start_page,
+        end_page=end_page,
+        max_chars=max_chars
+    )
+
+    with st.expander("LLM'e gönderilecek seçilmiş metni göster ve düzenle", expanded=False):
+        edited_report_text = st.text_area(
+            "Gerekirse burada metni düzenleyebilirsiniz. LLM bu metni kullanacaktır.",
+            value=report_text,
+            height=400
+        )
+
+    report_text = edited_report_text
+
+    if st.button("🚀 ESG Analizini Başlat"):
+        llm = get_llm()
+        prompt = create_extraction_prompt(company, year, report_text)
+
+        with st.spinner("ESG değişkenleri çıkarılıyor..."):
+            response = llm.invoke(prompt)
+            raw_text = response.content
+
+        result = extract_json_from_response(raw_text)
+
+        if result is None:
+            st.error("LLM yanıtı JSON formatında çözümlenemedi. Ham yanıt aşağıdadır.")
+            st.text(raw_text)
+            st.stop()
+
+        extracted_variables = result.get("extracted_variables", [])
+        textual_scores = result.get("textual_scores", {})
+        assessment = result.get("short_assessment", "")
+
+        variables_df = pd.DataFrame(extracted_variables)
+        variables_df = validate_evidence_against_text(variables_df, report_text)
+
+        if not variables_df.empty:
+            variables_df.insert(0, "company", company)
+            variables_df.insert(1, "year", year)
+        score_result = calculate_scores(textual_scores)
+        scores_df = pd.DataFrame([{
+            "company": company,
+            "year": year,
+            **score_result
+        }])
+
+        st.subheader("📊 Kanıtlı ESG Veri Çıkarımı")
+        st.dataframe(variables_df, use_container_width=True)
+
+        st.subheader("🧮 Metinsel Skorlar")
+        st.dataframe(scores_df, use_container_width=True)
+
+        st.subheader("📝 Kısa Değerlendirme")
+        st.write(assessment)
+
+        excel_file = create_excel(company, year, variables_df, scores_df, assessment)
+
+        st.download_button(
+            label="📥 Excel Olarak İndir",
+            data=excel_file,
+            file_name=f"{company}_{year}_ESG_AI_Agent_Cikarim.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+else:
+    st.warning("Lütfen analiz için bir PDF raporu yükleyin.")
