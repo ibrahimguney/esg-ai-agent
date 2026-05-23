@@ -1,7 +1,8 @@
 import os
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import ChatOpenAI
+
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph.message import add_messages
 
@@ -13,17 +14,12 @@ from tools import (
 
 load_dotenv()
 
-endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-api_key = os.getenv("AZURE_OPENAI_API_KEY")
-api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-llm = AzureChatOpenAI(
-    openai_api_version=api_version,
-    azure_deployment=deployment_name,
-    azure_endpoint=endpoint,
-    api_key=api_key,
-    temperature=0.7
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.3
 )
 
 class ResearchState(TypedDict):
@@ -150,7 +146,7 @@ def data_search_agent(state: ResearchState):
     if state["messages"]:
         user_query = state["messages"][0].content
     
-    print(f"� Searching Azure AI Search index for: {user_query}")
+    print(f"  Searching Azure AI Search index for: {user_query}")
     search_results = azure_vector_search(user_query, top_k=5, use_hybrid=True)
     formatted_results = format_azure_search_results(search_results)
     
